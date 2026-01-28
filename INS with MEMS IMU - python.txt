@@ -1,0 +1,185 @@
+import numpy as np
+
+# ----------------------------
+# Quaternion utilities
+# ----------------------------
+def quat_mul(q1, q2):
+    # q = [w, x, y, z]
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2
+    ], dtype=float)
+
+def quat_norm(q):
+    n = np.linalg.norm(q)
+    if n == 0:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    return q / n
+
+def quat_from_omega(omega_rad_s, dt):
+    # Small-angle quaternion from body angular rate omega
+    # omega is (3,)
+    theta = np.linalg.norm(omega_rad_s) * dt
+    if theta < 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+    axis = omega_rad_s / np.linalg.norm(omega_rad_s)
+    half = 0.5 * theta
+    return np.array([np.cos(half), *(axis*np.sin(half))], dtype=float)
+
+def quat_to_rotmat(q):
+    # Rotation matrix from body to nav if q is body->nav quaternion
+    w, x, y, z = q
+    R = np.array([
+        [1 - 2*(y*y+z*z),     2*(x*y - w*z),     2*(x*z + w*y)],
+        [    2*(x*y + w*z), 1 - 2*(x*x+z*z),     2*(y*z - w*x)],
+        [    2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x*x+y*y)]
+    ], dtype=float)
+    return R
+
+# ----------------------------
+# Simple Earth/gravity model
+# ----------------------------
+def gravity_ned(lat_rad, h_m):
+    """
+    Returns gravity magnitude (positive down) in NED frame as [0,0,g].
+    This is a simplified normal gravity model; good enough to start.
+    """
+    # Somigliana approximation (rough)
+    sin2 = np.sin(lat_rad)**2
+    g0 = 9.7803253359 * (1 + 0.00193185265241*sin2) / np.sqrt(1 - 0.00669437999013*sin2)
+    # height correction
+    g = g0 - 3.086e-6 * h_m
+    return np.array([0.0, 0.0, g], dtype=float)  # NED: +Down
+
+# ----------------------------
+# INS class
+# ----------------------------
+class StrapdownINS:
+    def __init__(self, lat_deg, lon_deg, h_m,
+                 init_yaw_deg=0.0, init_pitch_deg=0.0, init_roll_deg=0.0):
+
+        # State in navigation frame (NED)
+        self.lat = np.deg2rad(lat_deg)
+        self.lon = np.deg2rad(lon_deg)
+        self.h = float(h_m)
+
+        self.v_ned = np.zeros(3)   # [vn, ve, vd] m/s
+        self.p_ned = np.zeros(3)   # local NED position (m) relative to start
+
+        # Biases (MEMS needs these)
+        self.bg = np.zeros(3)      # gyro bias rad/s
+        self.ba = np.zeros(3)      # accel bias m/s^2
+
+        # Attitude quaternion body->nav
+        self.q_bn = self.euler_to_quat(np.deg2rad(init_roll_deg),
+                                       np.deg2rad(init_pitch_deg),
+                                       np.deg2rad(init_yaw_deg))
+
+        # Stationary detector params
+        self.stationary_gyr_thr = np.deg2rad(1.5)   # rad/s
+        self.stationary_acc_thr = 0.15              # m/s^2 around |g|
+        self.bias_alpha = 0.01                      # bias update rate
+
+    @staticmethod
+    def euler_to_quat(roll, pitch, yaw):
+        # ZYX yaw-pitch-roll
+        cr, sr = np.cos(roll/2), np.sin(roll/2)
+        cp, sp = np.cos(pitch/2), np.sin(pitch/2)
+        cy, sy = np.cos(yaw/2), np.sin(yaw/2)
+
+        w = cy*cp*cr + sy*sp*sr
+        x = cy*cp*sr - sy*sp*cr
+        y = cy*sp*cr + sy*cp*sr
+        z = sy*cp*cr - cy*sp*sr
+        return quat_norm(np.array([w, x, y, z], dtype=float))
+
+    def detect_stationary(self, omega_meas, acc_meas, g_mag):
+        # omega_meas in rad/s, acc_meas in m/s^2 (body)
+        omega_norm = np.linalg.norm(omega_meas)
+        acc_norm = np.linalg.norm(acc_meas)
+        return (omega_norm < self.stationary_gyr_thr) and (abs(acc_norm - g_mag) < self.stationary_acc_thr)
+
+    def update_biases_if_stationary(self, omega_meas, acc_meas):
+        # If stationary: accel should measure +g along body "down" direction in nav,
+        # but easiest practical approach: force velocity to 0 and slowly adapt biases.
+        g_n = gravity_ned(self.lat, self.h)
+        g_mag = g_n[2]
+
+        if self.detect_stationary(omega_meas, acc_meas, g_mag):
+            # Gyro bias tends to measured omega when stationary (true omega ~ 0)
+            self.bg = (1 - self.bias_alpha)*self.bg + self.bias_alpha*omega_meas
+
+            # Accel bias: when stationary, specific force in nav is approx -g (because accel measures proper accel),
+            # In body, expected is R_nb * (-g_n). (R_bn maps body->nav; so R_nb = R_bn.T)
+            R_bn = quat_to_rotmat(self.q_bn)
+            R_nb = R_bn.T
+            f_b_expected = R_nb @ (-g_n)  # expected specific force in body
+            # accel_meas = f_b_expected + ba  => ba ~ accel_meas - expected
+            ba_new = acc_meas - f_b_expected
+            self.ba = (1 - self.bias_alpha)*self.ba + self.bias_alpha*ba_new
+
+            # Optional: Zero-velocity update (ZUPT) for stability
+            self.v_ned[:] = 0.0
+
+    def step(self, gyro_deg_s, accel_g, dt):
+        """
+        gyro_deg_s: (3,) deg/s in body frame
+        accel_g: (3,) in g units in body frame (includes gravity)
+        dt: seconds
+        """
+        # Convert units
+        omega = np.deg2rad(np.asarray(gyro_deg_s, dtype=float))  # rad/s
+        acc = (np.asarray(accel_g, dtype=float) * 9.80665)       # m/s^2
+
+        # Bias update (optional but recommended)
+        self.update_biases_if_stationary(omega, acc)
+
+        # Remove biases
+        omega_u = omega - self.bg
+        acc_u = acc - self.ba
+
+        # 1) Attitude update (body->nav quaternion)
+        dq = quat_from_omega(omega_u, dt)
+        self.q_bn = quat_norm(quat_mul(self.q_bn, dq))
+
+        # 2) Specific force to nav
+        R_bn = quat_to_rotmat(self.q_bn)
+        f_n = R_bn @ acc_u  # specific force in nav
+
+        # 3) Add gravity (NED positive down) to get nav-frame acceleration
+        g_n = gravity_ned(self.lat, self.h)
+        a_n = f_n + g_n
+
+        # 4) Integrate velocity & position in local NED
+        self.v_ned += a_n * dt
+        self.p_ned += self.v_ned * dt
+
+        return {
+            "q_bn": self.q_bn.copy(),
+            "v_ned": self.v_ned.copy(),
+            "p_ned": self.p_ned.copy(),
+            "bg": self.bg.copy(),
+            "ba": self.ba.copy()
+        }
+
+# ----------------------------
+# Example usage
+# ----------------------------
+if __name__ == "__main__":
+    ins = StrapdownINS(lat_deg=60.1699, lon_deg=24.9384, h_m=20.0, init_yaw_deg=0)
+
+    # Example: feed IMU samples
+    dt = 0.01
+    for k in range(1000):
+        gyro = np.array([0.0, 0.0, 0.0])   # deg/s
+        acc  = np.array([0.0, 0.0, 1.0])   # g (stationary; z-axis aligned with gravity)
+        state = ins.step(gyro, acc, dt)
+
+    print("p_ned (m):", state["p_ned"])
+    print("v_ned (m/s):", state["v_ned"])
+    print("bg (rad/s):", state["bg"])
+    print("ba (m/s^2):", state["ba"])
